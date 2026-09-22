@@ -1,0 +1,40 @@
+#VRML_SIM R2023b utf8
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+IMPORTABLE EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/floors/protos/RectangleArena.proto"
+IMPORTABLE EXTERNPROTO "E-puck.proto"
+WorldInfo {
+  basicTimeStep 24
+}
+
+Viewpoint {
+  orientation -0.5773502691896258 0.5773502691896258 0.5773502691896258 2.0944
+  position 0.00011706497804167808 0.1699505320272429 4.101142536591572
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+
+DEF SUPERVISOR Robot {
+  children [
+
+    Receiver {
+      name "receiver"
+      channel 1
+    }
+
+    Emitter {
+      name "emitter"
+      channel 2
+    }
+
+    Emitter {
+      name "emitter_target"
+      channel 3
+    }
+  ]
+  name "supervisor"
+  controller "<extern>"
+  supervisor TRUE
+}
