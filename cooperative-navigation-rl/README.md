@@ -4,13 +4,6 @@
 
 ### RL info | 强化学习信息
 #### observation | 观测
-|索引|含义|
-|-----|-----|
-|`0: 12` | 2`pos` + 1`rotation` + 8`ps values` + 1`exist_obstacle`|
-|`12: 12 + 4 * 2` | (2`relative_pos_diff` + 1`relative_angle` + 1`relative_dis`) * `num_obs_agents`|
-|`12 + 4 * 2: 12 + 4 * (2 + 1)` | (2`relative_pos_diff` + 1`relative_angle` + 1`relative_dis`) *`obs_num_tartgets`|
-<!-- |`12 + 4 * 3:` | 2`pos` * `num_targets`| -->
-
 
 #### individual state | 全局状态
 `num_agent` * (2`pos` + 1`rotation`) + `num_target` * (2`pos`)

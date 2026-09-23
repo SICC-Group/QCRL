@@ -76,6 +76,22 @@ parser.add_argument('--sac_q_lr', type=float, default=3e-4,
                     help="Learning rate of SAC Q networks")
 parser.add_argument('--sac_cost_q_lr', type=float, default=3e-4,
                     help="Learning rate of the twin safety-cost Q networks")
+parser.add_argument('--qng_actor_interval', type=int, default=2,
+                    help="Apply the actor quantum natural-gradient update every N SAC updates")
+parser.add_argument('--qng_critic_interval', type=int, default=4,
+                    help="Apply critic quantum natural-gradient updates every N SAC updates")
+parser.add_argument('--qng_actor_lr', type=float, default=None,
+                    help="Quantum natural-gradient learning rate for the actor; defaults to sac_policy_lr")
+parser.add_argument('--qng_critic_lr', type=float, default=None,
+                    help="Quantum natural-gradient learning rate for critics; defaults to sac_q_lr")
+parser.add_argument('--qng_metric_batch_size', type=int, default=1,
+                    help="Maximum replay samples used to estimate each quantum Fisher matrix")
+parser.add_argument('--qng_damping', type=float, default=1e-4,
+                    help="Absolute diagonal damping used when solving the QNG system")
+parser.add_argument('--qng_relative_damping', type=float, default=1e-2,
+                    help="Damping multiplied by the mean Fisher diagonal")
+parser.add_argument('--qng_max_step_norm', type=float, default=0.1,
+                    help="Maximum norm of a QNG parameter step; <=0 disables clipping")
 parser.add_argument('--sac_alpha_lr', type=float, default=3e-4,
                     help="Learning rate of SAC temperature")
 parser.add_argument('--sac_alpha', type=float, default=0.2,

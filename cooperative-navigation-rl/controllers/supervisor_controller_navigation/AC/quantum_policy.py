@@ -4,7 +4,95 @@ import torch
 import torch.nn as nn
 
 
-class QuantumVariationalPolicy(nn.Module):
+class QuantumMetricMixin:
+    """Shared pure-state metric implementation for the actor and critics."""
+
+    def _build_state_circuit(self):
+        @qml.qnode(self.quantum_device, interface="torch", diff_method="backprop")
+        def circuit(encoded_angles, var_params):
+            for layer in range(self.reupload_layers):
+                for qubit in range(self.num_qubits):
+                    qml.RY(encoded_angles[layer, qubit, 0], wires=qubit)
+                    qml.RZ(encoded_angles[layer, qubit, 1], wires=qubit)
+                for qubit in range(self.num_qubits):
+                    qml.Rot(
+                        var_params[layer, qubit, 0],
+                        var_params[layer, qubit, 1],
+                        var_params[layer, qubit, 2],
+                        wires=qubit,
+                    )
+                for qubit in range(self.num_qubits - 1):
+                    qml.CNOT(wires=[qubit, qubit + 1])
+                qml.CNOT(wires=[self.num_qubits - 1, 0])
+
+            final_layer = var_params[self.reupload_layers]
+            for qubit in range(self.num_qubits):
+                qml.Rot(
+                    final_layer[qubit, 0],
+                    final_layer[qubit, 1],
+                    final_layer[qubit, 2],
+                    wires=qubit,
+                )
+            return qml.state()
+
+        return circuit
+
+    def _single_quantum_fisher(self, encoded_angles, flat_params):
+        """Calculate the pure-state Fubini-Study metric for one sample."""
+        encoded_angles = encoded_angles.detach()
+        parameter_shape = self.var_params.shape
+        parameter_count = flat_params.numel()
+
+        def real_imag_state(parameters):
+            shaped = parameters.reshape(parameter_shape)
+            state = self.metric_circuit(encoded_angles, shaped).reshape(-1)
+            return torch.cat((state.real, state.imag), dim=0)
+
+        state_parts = real_imag_state(flat_params)
+        state_count = state_parts.numel() // 2
+        jacobian = torch.autograd.functional.jacobian(
+            real_imag_state,
+            flat_params,
+            create_graph=False,
+            vectorize=False,
+        ).reshape(2 * state_count, parameter_count)
+
+        real_dtype = state_parts.dtype
+        state = torch.complex(
+            state_parts[:state_count], state_parts[state_count:]
+        )
+        state_jacobian = torch.complex(
+            jacobian[:state_count].to(dtype=real_dtype),
+            jacobian[state_count:].to(dtype=real_dtype),
+        )
+        overlap = state_jacobian.conj().transpose(0, 1) @ state
+        metric = (
+            state_jacobian.conj().transpose(0, 1) @ state_jacobian
+            - torch.outer(overlap, overlap.conj())
+        ).real
+        return 0.5 * (metric + metric.transpose(0, 1))
+
+    def quantum_fisher(self, encoded_angles, max_samples=None):
+        """Return a batch-averaged pure-state metric for ``var_params``."""
+        if encoded_angles.ndim == 3:
+            encoded_angles = encoded_angles.unsqueeze(0)
+        sample_count = encoded_angles.shape[0]
+        if max_samples is not None:
+            sample_count = min(sample_count, max(int(max_samples), 1))
+        if sample_count < 1:
+            raise ValueError("encoded_angles must contain at least one sample")
+
+        flat_params = self.var_params.detach().reshape(-1).clone()
+        flat_params.requires_grad_(True)
+        metric = None
+        for sample in encoded_angles[:sample_count]:
+            sample_metric = self._single_quantum_fisher(sample, flat_params)
+            metric = sample_metric if metric is None else metric + sample_metric
+        metric = metric / float(sample_count)
+        return metric.detach().to(device=self.var_params.device, dtype=torch.float64)
+
+
+class QuantumVariationalPolicy(QuantumMetricMixin, nn.Module):
     def __init__(
         self,
         obs_dim,
@@ -54,6 +142,7 @@ class QuantumVariationalPolicy(nn.Module):
 
         self.quantum_device = qml.device("default.qubit", wires=self.num_qubits)
         self.quantum_circuit = self._build_quantum_circuit()
+        self.metric_circuit = self._build_state_circuit()
 
     def _build_quantum_circuit(self):
         @qml.qnode(self.quantum_device, interface="torch", diff_method="backprop")
@@ -135,7 +224,7 @@ class QuantumVariationalPolicy(nn.Module):
         return action, log_prob
     
 
-class QuantumQNetwork(nn.Module):
+class QuantumQNetwork(QuantumMetricMixin, nn.Module):
     def __init__(
         self,
         state_dim,
@@ -181,6 +270,7 @@ class QuantumQNetwork(nn.Module):
 
         self.quantum_device = qml.device("default.qubit", wires=self.num_qubits)
         self.quantum_circuit = self._build_quantum_circuit()
+        self.metric_circuit = self._build_state_circuit()
 
     def _init_action_angle_scales(self):
         with torch.no_grad():

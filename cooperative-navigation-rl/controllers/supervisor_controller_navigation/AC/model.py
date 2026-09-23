@@ -212,6 +212,33 @@ class Model(nn.Module):
         self.use_constraint_manifold = bool(args.use_constraint_manifold)
         self.action_smoothing_beta = float(np.clip(getattr(args, "action_smoothing_beta", 0.0), 0.0, 0.99))
 
+        # QNG is applied to the quantum variational parameters only.  The
+        # classical encoders/readout layers continue to use Adam, so the
+        # hybrid networks are not updated twice on the same parameter.
+        self.qng_actor_interval = max(int(getattr(args, "qng_actor_interval", 2)), 1)
+        self.qng_critic_interval = max(int(getattr(args, "qng_critic_interval", 4)), 1)
+        self.qng_metric_batch_size = max(
+            int(getattr(args, "qng_metric_batch_size", 1)), 1
+        )
+        self.qng_damping = max(float(getattr(args, "qng_damping", 1e-4)), 0.0)
+        self.qng_relative_damping = max(
+            float(getattr(args, "qng_relative_damping", 1e-2)), 0.0
+        )
+        self.qng_max_step_norm = float(getattr(args, "qng_max_step_norm", 0.1))
+        self.qng_actor_lr = float(
+            getattr(args, "qng_actor_lr", None)
+            if getattr(args, "qng_actor_lr", None) is not None
+            else args.sac_policy_lr
+        )
+        qng_critic_lr = getattr(args, "qng_critic_lr", None)
+        self.qng_critic_lr = float(
+            args.sac_q_lr if qng_critic_lr is None else qng_critic_lr
+        )
+        self.qng_cost_critic_lr = float(
+            args.sac_cost_q_lr if qng_critic_lr is None else qng_critic_lr
+        )
+        self.train_step_count = 0
+
         safety_margin = args.manifold_safety_margin
         if safety_margin < 0:
             safety_margin = args.collision_distance
@@ -297,11 +324,21 @@ class Model(nn.Module):
         for p in self.cost_q2_target.parameters():
             p.requires_grad = False
 
-        self.policy_opt = torch.optim.Adam(self.policy.parameters(), lr=args.sac_policy_lr)
-        self.q1_opt = torch.optim.Adam(self.q1.parameters(), lr=args.sac_q_lr)
-        self.q2_opt = torch.optim.Adam(self.q2.parameters(), lr=args.sac_q_lr)
-        self.cost_q1_opt = torch.optim.Adam(self.cost_q1.parameters(), lr=args.sac_cost_q_lr)
-        self.cost_q2_opt = torch.optim.Adam(self.cost_q2.parameters(), lr=args.sac_cost_q_lr)
+        self.policy_opt = torch.optim.Adam(
+            self._adam_parameters(self.policy), lr=args.sac_policy_lr
+        )
+        self.q1_opt = torch.optim.Adam(
+            self._adam_parameters(self.q1), lr=args.sac_q_lr
+        )
+        self.q2_opt = torch.optim.Adam(
+            self._adam_parameters(self.q2), lr=args.sac_q_lr
+        )
+        self.cost_q1_opt = torch.optim.Adam(
+            self._adam_parameters(self.cost_q1), lr=args.sac_cost_q_lr
+        )
+        self.cost_q2_opt = torch.optim.Adam(
+            self._adam_parameters(self.cost_q2), lr=args.sac_cost_q_lr
+        )
 
         self.safety_cost_limit = float(args.safety_cost_limit)
         self.safety_cost_max = max(float(getattr(args, "safety_cost_max", 1.0)), 1e-6)
@@ -467,9 +504,103 @@ class Model(nn.Module):
             for parameter in network.parameters():
                 parameter.requires_grad_(enabled)
 
+    @staticmethod
+    def _adam_parameters(network):
+        """Exclude the quantum variational tensor from the Adam optimizers."""
+        return [
+            parameter
+            for name, parameter in network.named_parameters()
+            if name != "var_params"
+        ]
+
+    @staticmethod
+    def _clear_quantum_grad(network):
+        parameter = getattr(network, "var_params", None)
+        if parameter is not None:
+            parameter.grad = None
+
+    def _apply_qng_update(self, network, encoded_angles, learning_rate):
+        """Apply one damped natural-gradient update to ``network.var_params``.
+
+        The Fisher matrix is calculated from detached circuit inputs and
+        parameters, so no graph from the SAC loss is retained.  Eigenvalue
+        flooring makes the solve stable even when the circuit contains
+        locally redundant rotations.
+        """
+        parameter = getattr(network, "var_params", None)
+        if parameter is None or parameter.grad is None:
+            return {"updated": 0.0, "step_norm": 0.0, "condition": 0.0}
+
+        gradient = parameter.grad.detach().reshape(-1)
+        if not torch.isfinite(gradient).all():
+            parameter.grad = None
+            return {"updated": 0.0, "step_norm": 0.0, "condition": 0.0}
+
+        # ``quantum_fisher`` internally differentiates the state with respect
+        # to a temporary parameter tensor, so it must not be wrapped in
+        # ``torch.no_grad`` even though the returned metric is detached.
+        fisher = network.quantum_fisher(
+            encoded_angles.detach(),
+            max_samples=self.qng_metric_batch_size,
+        )
+        fisher = 0.5 * (fisher + fisher.transpose(0, 1))
+        gradient = gradient.to(device=fisher.device, dtype=fisher.dtype)
+        if not torch.isfinite(fisher).all():
+            parameter.grad = None
+            return {"updated": 0.0, "step_norm": 0.0, "condition": 0.0}
+
+        parameter_count = gradient.numel()
+        mean_diagonal = torch.trace(fisher) / float(parameter_count)
+        damping = self.qng_damping + self.qng_relative_damping * mean_diagonal.abs()
+        damping = damping.clamp_min(1e-8)
+
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(fisher)
+            eigenvalues = eigenvalues.clamp_min(damping)
+            direction = eigenvectors @ (
+                eigenvectors.transpose(0, 1) @ gradient / eigenvalues
+            )
+            condition = float(
+                (eigenvalues.max() / eigenvalues.min()).detach().cpu().item()
+            )
+        except RuntimeError:
+            regularized = fisher + damping * torch.eye(
+                parameter_count, device=fisher.device, dtype=fisher.dtype
+            )
+            direction = torch.linalg.solve(regularized, gradient)
+            condition = 0.0
+
+        update = float(learning_rate) * direction
+        update_norm_tensor = torch.linalg.vector_norm(update)
+        if (
+            self.qng_max_step_norm > 0.0
+            and update_norm_tensor > self.qng_max_step_norm
+        ):
+            update = update * (self.qng_max_step_norm / update_norm_tensor)
+            update_norm_tensor = torch.linalg.vector_norm(update)
+        update_norm = float(update_norm_tensor.detach().cpu().item())
+        with torch.no_grad():
+            parameter.add_(-update.to(device=parameter.device, dtype=parameter.dtype).view_as(parameter))
+        parameter.grad = None
+        return {
+            "updated": 1.0,
+            "step_norm": update_norm,
+            "condition": condition,
+        }
+
     def train_step(self):
         if not self.can_update():
             return None
+
+        self.train_step_count += 1
+        qng_actor_due = (
+            self.policy_arch == "quantum"
+            and self.train_step_count % self.qng_actor_interval == 0
+        )
+        qng_critic_due = (
+            self.critic_arch == "quantum"
+            and self.train_step_count % self.qng_critic_interval == 0
+        )
 
         self.train()
         batch = self.replay_buffer.sample(self.batch_size, self.device)
@@ -519,26 +650,70 @@ class Model(nn.Module):
         q1_loss = F.mse_loss(q1_pred, target_value)
         q2_loss = F.mse_loss(q2_pred, target_value)
 
+        self._clear_quantum_grad(self.q1)
         self.q1_opt.zero_grad()
         q1_loss.backward()
+        q1_qng_info = {"updated": 0.0, "step_norm": 0.0, "condition": 0.0}
+        if qng_critic_due and hasattr(self.q1, "quantum_fisher"):
+            q1_angles = self.q1._encode_input(
+                torch.cat([state.detach(), action.detach()], dim=-1),
+                action.detach(),
+            )
+            q1_qng_info = self._apply_qng_update(self.q1, q1_angles, self.qng_critic_lr)
         self.q1_opt.step()
+        if not q1_qng_info["updated"]:
+            self._clear_quantum_grad(self.q1)
 
+        self._clear_quantum_grad(self.q2)
         self.q2_opt.zero_grad()
         q2_loss.backward()
+        q2_qng_info = {"updated": 0.0, "step_norm": 0.0, "condition": 0.0}
+        if qng_critic_due and hasattr(self.q2, "quantum_fisher"):
+            q2_angles = self.q2._encode_input(
+                torch.cat([state.detach(), action.detach()], dim=-1),
+                action.detach(),
+            )
+            q2_qng_info = self._apply_qng_update(self.q2, q2_angles, self.qng_critic_lr)
         self.q2_opt.step()
+        if not q2_qng_info["updated"]:
+            self._clear_quantum_grad(self.q2)
 
         cost_q1_pred = self.cost_q1(state, action)
         cost_q2_pred = self.cost_q2(state, action)
         cost_q1_loss = F.mse_loss(cost_q1_pred, target_cost)
         cost_q2_loss = F.mse_loss(cost_q2_pred, target_cost)
 
+        self._clear_quantum_grad(self.cost_q1)
         self.cost_q1_opt.zero_grad()
         cost_q1_loss.backward()
+        cost_q1_qng_info = {"updated": 0.0, "step_norm": 0.0, "condition": 0.0}
+        if qng_critic_due and hasattr(self.cost_q1, "quantum_fisher"):
+            cost_q1_angles = self.cost_q1._encode_input(
+                torch.cat([state.detach(), action.detach()], dim=-1),
+                action.detach(),
+            )
+            cost_q1_qng_info = self._apply_qng_update(
+                self.cost_q1, cost_q1_angles, self.qng_cost_critic_lr
+            )
         self.cost_q1_opt.step()
+        if not cost_q1_qng_info["updated"]:
+            self._clear_quantum_grad(self.cost_q1)
 
+        self._clear_quantum_grad(self.cost_q2)
         self.cost_q2_opt.zero_grad()
         cost_q2_loss.backward()
+        cost_q2_qng_info = {"updated": 0.0, "step_norm": 0.0, "condition": 0.0}
+        if qng_critic_due and hasattr(self.cost_q2, "quantum_fisher"):
+            cost_q2_angles = self.cost_q2._encode_input(
+                torch.cat([state.detach(), action.detach()], dim=-1),
+                action.detach(),
+            )
+            cost_q2_qng_info = self._apply_qng_update(
+                self.cost_q2, cost_q2_angles, self.qng_cost_critic_lr
+            )
         self.cost_q2_opt.step()
+        if not cost_q2_qng_info["updated"]:
+            self._clear_quantum_grad(self.cost_q2)
 
         new_raw_action, log_prob = self.policy.sample(obs, deterministic=False)
         new_action = self._executed_policy_action(
@@ -565,9 +740,19 @@ class Model(nn.Module):
             + lagrange * cost_q_new
         ).mean()
 
+        self._clear_quantum_grad(self.policy)
         self.policy_opt.zero_grad()
         actor_loss.backward()
+        actor_qng_info = {"updated": 0.0, "step_norm": 0.0, "condition": 0.0}
+        if qng_actor_due and hasattr(self.policy, "quantum_fisher"):
+            with torch.no_grad():
+                actor_angles = self.policy._encode_obs(obs.detach())
+            actor_qng_info = self._apply_qng_update(
+                self.policy, actor_angles, self.qng_actor_lr
+            )
         self.policy_opt.step()
+        if not actor_qng_info["updated"]:
+            self._clear_quantum_grad(self.policy)
         self._set_requires_grad(
             (self.q1, self.q2, self.cost_q1, self.cost_q2), True
         )
@@ -623,4 +808,19 @@ class Model(nn.Module):
             "lambda": float(self.lagrange_multiplier.detach().cpu().item()),
             "cost_estimate": cost_estimate,
             "cost_gap": float(cost_gap),
+            "train_step": self.train_step_count,
+            "qng_actor_updated": actor_qng_info["updated"],
+            "qng_actor_step_norm": actor_qng_info["step_norm"],
+            "qng_critic_updated": float(
+                q1_qng_info["updated"]
+                + q2_qng_info["updated"]
+                + cost_q1_qng_info["updated"]
+                + cost_q2_qng_info["updated"]
+            ),
+            "qng_critic_step_norm": float(
+                q1_qng_info["step_norm"]
+                + q2_qng_info["step_norm"]
+                + cost_q1_qng_info["step_norm"]
+                + cost_q2_qng_info["step_norm"]
+            ),
         }
